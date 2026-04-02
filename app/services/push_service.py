@@ -7,11 +7,16 @@ Provides:
 - P1 batch windowed delivery (30 min)
 - P2 user-controlled frequency
 - Token bucket rate limiting for Feishu API (60/min)
+
+M3 Enhancements:
+- Integrated P1 batching service for 30-min windowed delivery
+- P2 frequency control based on user preferences
+- Push configuration management for user preferences
 """
 import json
 import uuid
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timedelta
+from typing import Optional, List
 
 try:
     import redis.asyncio as redis
@@ -204,6 +209,178 @@ class PushService:
             title=title,
             content=content,
             url=url,
+        )
+
+    # P2 Frequency control keys
+    P2_LAST_PUSH_KEY = "push:p2:last"
+    P2_QUEUE_KEY = "push:p2:pending"
+
+    async def enqueue_p2_notification(
+        self,
+        msg_type: str,
+        title: str,
+        content: str,
+        url: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> str:
+        """
+        Enqueue a P2 notification with user-controlled frequency.
+        
+        P2 messages are rate-limited based on user preferences:
+        - real_time: No batching, send immediately (if not rate limited)
+        - hourly: At most once per hour per user
+        - daily: At most once per day per user
+        - weekly: At most once per week per user
+        - off: Don't send
+        
+        Args:
+            msg_type: Message type
+            title: Notification title
+            content: Notification content
+            url: Optional deep link
+            user_id: Target user open_id (required for frequency control)
+            
+        Returns:
+            Message ID, or empty string if rate limited
+        """
+        await self._ensure_connected()
+        
+        # Check user frequency preference
+        if user_id:
+            from app.services.push_config_service import get_push_config_service, PushFrequency
+            
+            config_service = get_push_config_service()
+            config = await config_service.get_user_config(user_id)
+            
+            if config.p2_frequency == PushFrequency.OFF:
+                logger.info(f"P2 push skipped for {user_id}: frequency set to OFF")
+                return ""
+            
+            # Check rate limit based on frequency
+            if not await self._check_p2_rate_limit(user_id, config.p2_frequency):
+                logger.info(f"P2 push skipped for {user_id}: rate limited ({config.p2_frequency})")
+                return ""
+        
+        return await self.enqueue_message(
+            level="P2",
+            msg_type=msg_type,
+            title=title,
+            content=content,
+            url=url,
+            user_id=user_id,
+        )
+
+    async def _check_p2_rate_limit(self, user_id: str, frequency: str) -> bool:
+        """
+        Check if P2 push is within rate limit for user.
+        
+        Args:
+            user_id: User open_id
+            frequency: PushFrequency value
+            
+        Returns:
+            True if allowed, False if rate limited
+        """
+        if not self._connected:
+            return True  # Allow in mock mode
+        
+        key = f"{self.P2_LAST_PUSH_KEY}:{user_id}"
+        
+        try:
+            last_push = await self._redis.get(key)
+            
+            if last_push is None:
+                # Never pushed, allow
+                return True
+            
+            last_time = datetime.fromisoformat(last_push)
+            now = datetime.utcnow()
+            elapsed = (now - last_time).total_seconds()
+            
+            if frequency == "real_time":
+                # 1 minute cooldown
+                return elapsed >= 60
+            elif frequency == "hourly":
+                return elapsed >= 3600
+            elif frequency == "daily":
+                return elapsed >= 86400
+            elif frequency == "weekly":
+                return elapsed >= 604800
+            else:
+                return True
+                
+        except Exception as e:
+            logger.warning(f"Failed to check P2 rate limit: {e}")
+            return True  # Allow on error
+
+    async def record_p2_push(self, user_id: str) -> None:
+        """
+        Record a P2 push for rate limiting.
+        
+        Args:
+            user_id: User open_id
+        """
+        await self._ensure_connected()
+        
+        if not self._connected:
+            return
+        
+        key = f"{self.P2_LAST_PUSH_KEY}:{user_id}"
+        now = datetime.utcnow().isoformat()
+        
+        try:
+            await self._redis.set(key, now)
+        except Exception as e:
+            logger.warning(f"Failed to record P2 push: {e}")
+
+    async def enqueue_dr_alert(
+        self,
+        alert_level: str,
+        title: str,
+        content: str,
+        signal_id: Optional[str] = None,
+        url: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> str:
+        """
+        Enqueue a DR (Data Report) platform alert.
+        
+        DR alerts are mapped to push levels:
+        - critical -> P0 (immediate)
+        - error -> P1 (batched)
+        - warning -> P1 (batched)
+        - info -> P2 (frequency controlled)
+        
+        Args:
+            alert_level: DR alert level (critical/error/warning/info)
+            title: Alert title
+            content: Alert content
+            signal_id: Optional related signal ID
+            url: Optional deep link
+            user_id: Optional target user
+            
+        Returns:
+            Message ID
+        """
+        # Map DR level to push level
+        level_map = {
+            "critical": "P0",
+            "error": "P1",
+            "warning": "P1",
+            "info": "P2",
+        }
+        push_level = level_map.get(alert_level.lower(), "P1")
+        
+        if signal_id:
+            content = f"{content}\n\n📊 Signal: `{signal_id}`"
+        
+        return await self.enqueue_message(
+            level=push_level,
+            msg_type="dr_alert",
+            title=title,
+            content=content,
+            url=url,
+            user_id=user_id,
         )
 
     async def acquire_rate_limit_token(self) -> bool:

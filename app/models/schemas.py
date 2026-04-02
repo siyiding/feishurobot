@@ -5,10 +5,11 @@ from pydantic import BaseModel, Field
 
 
 class IntentType(str, Enum):
-    """Three types of user intent."""
+    """Four types of user intent."""
     QUERY = "query"      # 查缺陷、查用例、查里程
     ACTION = "action"   # 创建缺陷、更新状态
-    REPORT = "report"   # 生成周报/专项报告
+    REPORT = "report"    # 生成周报/专项报告
+    CONFIG = "config"   # M3: 推送配置管理
 
 
 class IntentConfidence(BaseModel):

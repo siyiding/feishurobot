@@ -298,10 +298,156 @@ async def execute_handler(handler_name: str, params: dict, command) -> str:
 
     elif category == "report":
         if action == "weekly_report":
-            return "周报生成功能正在开发中，预计M3阶段完成。"
+            # M3: 周报摘要推送
+            try:
+                from app.services.weekly_report_service import get_weekly_report_service
+                report_service = get_weekly_report_service()
+                project_key = params.get("project_key", "ICC")
+                content = await report_service.generate_weekly_summary(project_key)
+                
+                # Push the report
+                from app.services.push_service import get_push_service
+                push_svc = get_push_service()
+                await push_svc.enqueue_p1_notification(
+                    msg_type="weekly_report",
+                    title="📊 周报摘要",
+                    content=content,
+                )
+                return "周报已生成并推送，请查收。"
+            except Exception as e:
+                logger.error(f"Failed to generate weekly report: {e}")
+                return f"周报生成失败: {str(e)}"
+        
         elif action == "monthly_report":
             return "月报生成功能正在开发中，预计M3阶段完成。"
         else:
             return f"未知的报告类型: {action}"
 
+    elif category == "config":
+        # M3: 推送配置管理
+        if action == "push_config":
+            return await handle_push_config(command, params, sender_id)
+        else:
+            return f"未知的配置类型: {action}"
+
     return "无法识别命令类型，请重试。"
+
+
+async def handle_push_config(command, params: dict, sender_id: str) -> str:
+    """
+    Handle push configuration commands.
+    
+    Commands:
+    - 查询推送配置: 查看当前配置
+    - 设置P1合并窗口30分钟: 设置P1批处理窗口
+    - 设置P2频率每小时: 设置P2推送频率
+    - 开启推送/关闭推送: 启用/禁用推送
+    - 设置免打扰22:00-08:00: 设置免打扰时段
+    """
+    try:
+        from app.services.push_config_service import get_push_config_service, PushConfig, PushFrequency
+        
+        config_service = get_push_config_service()
+        config = await config_service.get_user_config(sender_id)
+        
+        raw_msg = command.raw_message.lower()
+        
+        # Query current config
+        if "查询" in raw_msg or "查看" in raw_msg or "当前" in raw_msg:
+            return format_push_config(config)
+        
+        # Toggle push on/off
+        if "开启推送" in raw_msg or "启用推送" in raw_msg:
+            config.push_enabled = True
+            await config_service.update_user_config(sender_id, config)
+            return "✅ 推送已开启"
+        
+        if "关闭推送" in raw_msg or "禁用推送" in raw_msg:
+            config.push_enabled = False
+            await config_service.update_user_config(sender_id, config)
+            return "✅ 推送已关闭"
+        
+        # Set P1 batch window
+        if "P1" in raw_msg and "合并窗口" in raw_msg:
+            import re
+            match = re.search(r"(\\d+)\\s*分钟", raw_msg)
+            if match:
+                minutes = int(match.group(1))
+                config.p1_batch_minutes = minutes
+                await config_service.update_user_config(sender_id, config)
+                return f"✅ P1合并窗口已设置为 {minutes} 分钟"
+        
+        # Set P2 frequency
+        if "P2" in raw_msg and "频率" in raw_msg:
+            if "实时" in raw_msg or "real" in raw_msg:
+                config.p2_frequency = PushFrequency.REAL_TIME
+            elif "每小时" in raw_msg or "hourly" in raw_msg:
+                config.p2_frequency = PushFrequency.HOURLY
+            elif "每日" in raw_msg or "daily" in raw_msg:
+                config.p2_frequency = PushFrequency.DAILY
+            elif "每周" in raw_msg or "weekly" in raw_msg:
+                config.p2_frequency = PushFrequency.WEEKLY
+            elif "关闭" in raw_msg or "off" in raw_msg:
+                config.p2_frequency = PushFrequency.OFF
+            else:
+                return "未知频率设置"
+            
+            await config_service.update_user_config(sender_id, config)
+            freq_display = {
+                "real_time": "实时",
+                "hourly": "每小时",
+                "daily": "每日",
+                "weekly": "每周",
+                "off": "关闭",
+            }.get(config.p2_frequency.value, config.p2_frequency.value)
+            return f"✅ P2推送频率已设置为 {freq_display}"
+        
+        # Set quiet hours
+        if "免打扰" in raw_msg or "quiet" in raw_msg:
+            import re
+            match = re.search(r"(\\d{1,2}):(\\d{2})\\s*[-~]\\s*(\\d{1,2}):(\\d{2})", raw_msg)
+            if match:
+                start_hour, start_min = int(match.group(1)), int(match.group(2))
+                end_hour, end_min = int(match.group(3)), int(match.group(4))
+                
+                if 0 <= start_hour <= 23 and 0 <= end_hour <= 23:
+                    config.quiet_hours_start = f"{start_hour:02d}:{start_min:02d}"
+                    config.quiet_hours_end = f"{end_hour:02d}:{end_min:02d}"
+                    await config_service.update_user_config(sender_id, config)
+                    return f"✅ 免打扰时段已设置为 {config.quiet_hours_start} - {config.quiet_hours_end}"
+        
+        # Default: show current config
+        return format_push_config(config)
+        
+    except Exception as e:
+        logger.error(f"Failed to handle push config: {e}")
+        return f"配置操作失败: {str(e)}"
+
+
+def format_push_config(config) -> str:
+    """Format push configuration for display."""
+    freq_display = {
+        "real_time": "实时",
+        "hourly": "每小时",
+        "daily": "每日",
+        "weekly": "每周",
+        "off": "关闭",
+    }.get(config.p2_frequency.value if hasattr(config.p2_frequency, 'value') else config.p2_frequency, str(config.p2_frequency))
+    
+    quiet = f"{config.quiet_hours_start} - {config.quiet_hours_end}" if config.quiet_hours_start and config.quiet_hours_end else "未设置"
+    
+    lines = [
+        "📬 **推送配置**\n",
+        f"- 推送状态: {'✅ 开启' if config.push_enabled else '❌ 关闭'}",
+        f"- P1合并窗口: {config.p1_batch_minutes} 分钟",
+        f"- P2推送频率: {freq_display}",
+        f"- 免打扰时段: {quiet}",
+        f"- 周报推送: 每周 {config.weekly_report_day} {config.weekly_report_time}",
+        "",
+        "可用命令：",
+        "• 开启推送 / 关闭推送",
+        "• 设置P1合并窗口30分钟",
+        "• 设置P2频率每小时/每日/每周/关闭",
+        "• 设置免打扰22:00-08:00",
+    ]
+    return "\n".join(lines)

@@ -1,10 +1,11 @@
 """
 Intent recognition and routing.
 
-Classifies incoming messages into three types:
+Classifies incoming messages into four types:
 - QUERY: 查缺陷、查用例、查里程
 - ACTION: 创建缺陷、更新状态
 - REPORT: 生成周报/专项报告
+- CONFIG: 推送配置管理 (M3 新增)
 """
 import re
 from typing import List, Tuple
@@ -38,6 +39,17 @@ REPORT_PATTERNS = [
     (r"导出|生成.*报告", IntentType.REPORT),
 ]
 
+# M3: CONFIG patterns for push notification management
+# Note: These patterns should be checked BEFORE QUERY_PATTERNS
+# Using case-insensitive matching for P1/P2 prefixes
+CONFIG_PATTERNS = [
+    (r"推送配置|配置推送|设置推送", IntentType.CONFIG),
+    (r"开启推送|关闭推送|启用推送|禁用推送", IntentType.CONFIG),
+    (r"[Pp]1合并窗口|[Pp]1批处理|[Pp]2频率", IntentType.CONFIG),
+    (r"免打扰|quiet.?hours", IntentType.CONFIG),
+    (r"设置.*频率|设置.*时段", IntentType.CONFIG),
+]
+
 
 # Bug creation patterns
 CREATE_BUG_PATTERNS = [
@@ -69,7 +81,12 @@ def recognize_intent(message: str) -> IntentConfidence:
         )
 
     message_lower = message.lower()
-    scores = {IntentType.QUERY: 0.0, IntentType.ACTION: 0.0, IntentType.REPORT: 0.0}
+    scores = {
+        IntentType.QUERY: 0.0,
+        IntentType.ACTION: 0.0,
+        IntentType.REPORT: 0.0,
+        IntentType.CONFIG: 0.0,
+    }
     reasons = []
 
     # Check QUERY patterns
@@ -89,6 +106,12 @@ def recognize_intent(message: str) -> IntentConfidence:
         if re.search(pattern, message_lower):
             scores[IntentType.REPORT] += 0.35
             reasons.append(f"REPORT pattern: {pattern}")
+
+    # Check CONFIG patterns (M3) - use original message for P1/P2 case-sensitive matching
+    for pattern, intent in CONFIG_PATTERNS:
+        if re.search(pattern, message) or re.search(pattern, message_lower):
+            scores[IntentType.CONFIG] += 0.5
+            reasons.append(f"CONFIG pattern: {pattern}")
 
     # Normalize and pick highest
     total = sum(scores.values())
@@ -235,6 +258,23 @@ def parse_command(message: str, intent: IntentType) -> BotCommand:
             sub_command = "monthly_report"
         else:
             sub_command = "weekly_report"
+    
+    elif intent == IntentType.CONFIG:
+        # M3: Push configuration commands
+        if "推送配置" in message or "配置推送" in message:
+            sub_command = "push_config"
+        elif "开启推送" in message or "启用推送" in message:
+            sub_command = "push_config"
+        elif "关闭推送" in message or "禁用推送" in message:
+            sub_command = "push_config"
+        elif "P1" in message and ("合并" in message or "窗口" in message or "批处理" in message):
+            sub_command = "push_config"
+        elif "P2" in message and "频率" in message:
+            sub_command = "push_config"
+        elif "免打扰" in message:
+            sub_command = "push_config"
+        else:
+            sub_command = "push_config"  # Default to push config query
 
     return BotCommand(
         raw_message=message,
@@ -256,5 +296,7 @@ def route_command(command: BotCommand) -> Tuple[str, dict]:
         return f"action.{command.sub_command or 'create_bug'}", command.params
     elif command.intent == IntentType.REPORT:
         return f"report.{command.sub_command or 'weekly_report'}", command.params
+    elif command.intent == IntentType.CONFIG:
+        return f"config.{command.sub_command or 'push_config'}", command.params
     
     return "query.query_bugs", {}
