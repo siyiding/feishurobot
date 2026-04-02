@@ -141,6 +141,18 @@ def parse_command(message: str, intent: IntentType) -> BotCommand:
         params["status"] = "closed"
     elif re.search(r"已拒绝|rejected", message.lower()):
         params["status"] = "rejected"
+    
+    # Extract test case status keywords
+    elif re.search(r"待执行|pending", message.lower()):
+        params["status"] = "待执行"
+    elif re.search(r"通过|passed", message.lower()):
+        params["status"] = "通过"
+    elif re.search(r"失败|failed", message.lower()):
+        params["status"] = "失败"
+    elif re.search(r"阻塞|blocked", message.lower()):
+        params["status"] = "阻塞"
+    elif re.search(r"跳过|skipped", message.lower()):
+        params["status"] = "跳过"
 
     # Extract priority
     if re.search(r"p0|P0|严重", message):
@@ -156,6 +168,30 @@ def parse_command(message: str, intent: IntentType) -> BotCommand:
     assignee_match = re.search(r"指派给\s*(\S+)", message)
     if assignee_match:
         params["assignee"] = assignee_match.group(1)
+    
+    # Extract executor for test cases
+    executor_match = re.search(r"执行人\s*[是为]?\s*(\S+)", message)
+    if executor_match:
+        params["executor"] = executor_match.group(1)
+    
+    # Extract module for test cases
+    module_match = re.search(r"(?:功能)?模块\s*[是为]?\s*(\S+)", message)
+    if module_match:
+        params["module"] = module_match.group(1)
+    
+    # Extract test case type
+    if re.search(r"功能测试", message):
+        params["case_type"] = "功能测试"
+    elif re.search(r"性能测试", message):
+        params["case_type"] = "性能测试"
+    elif re.search(r"集成测试", message):
+        params["case_type"] = "集成测试"
+    elif re.search(r"系统测试", message):
+        params["case_type"] = "系统测试"
+    elif re.search(r"冒烟测试", message):
+        params["case_type"] = "冒烟测试"
+    elif re.search(r"回归测试", message):
+        params["case_type"] = "回归测试"
 
     # Extract bug title for creation
     if intent == IntentType.ACTION and ("创建" in message or "新建" in message or "添加" in message):

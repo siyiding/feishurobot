@@ -145,7 +145,36 @@ async def execute_handler(handler_name: str, params: dict, command) -> str:
             return "\n".join(lines)
         
         elif action == "query_testcases":
-            return "用例查询功能正在开发中，预计M2阶段完成。"
+            from app.models.schemas import TestCaseQueryRequest, TestCaseType, TestCaseStatus
+            from app.services.feishu_sheet_client import get_sheet_client
+            
+            # Parse query parameters
+            case_type = None
+            if params.get("case_type"):
+                try:
+                    case_type = TestCaseType(params["case_type"])
+                except ValueError:
+                    pass
+            
+            status = None
+            if params.get("status"):
+                try:
+                    status = TestCaseStatus(params["status"])
+                except ValueError:
+                    pass
+            
+            req = TestCaseQueryRequest(
+                case_type=case_type,
+                module=params.get("module"),
+                status=status,
+                priority=params.get("priority"),
+                executor=params.get("executor"),
+                page_size=20,
+            )
+            
+            client_sheet = get_sheet_client()
+            resp = await client_sheet.query_test_cases(req)
+            return client_sheet.format_test_case_list(resp)
         
         else:
             return f"未知的查询类型: {action}"
@@ -209,7 +238,7 @@ async def execute_handler(handler_name: str, params: dict, command) -> str:
             return resp.message
         
         elif action == "update_bug":
-            from app.models.schemas import BugUpdateRequest, BugStatus
+            from app.models.schemas import BugUpdateRequest, BugStatus, BugPriority
             
             bug_id = params.get("bug_id")
             if not bug_id:

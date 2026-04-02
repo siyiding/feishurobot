@@ -146,3 +146,99 @@ class BotResponse(BaseModel):
     intent: IntentType
     data: Optional[Any] = None
     error: Optional[str] = None
+
+
+# ============== Test Case (用例) Schemas ==============
+
+class TestCaseType(str, Enum):
+    """Test case type enum."""
+    FUNCTION = "功能测试"
+    PERFORMANCE = "性能测试"
+    INTEGRATION = "集成测试"
+    SYSTEM = "系统测试"
+    SMOKE = "冒烟测试"
+    REGRESSION = "回归测试"
+
+
+class TestCaseStatus(str, Enum):
+    """Test case execution status."""
+    PENDING = "待执行"
+    PASSED = "通过"
+    FAILED = "失败"
+    BLOCKED = "阻塞"
+    SKIPPED = "跳过"
+
+
+class TestCaseInfo(BaseModel):
+    """Test case info from Feishu Sheets."""
+    case_id: str
+    case_name: str
+    case_type: Optional[TestCaseType] = None
+    module: Optional[str] = None
+    related_requirement: Optional[str] = None
+    priority: Optional[str] = None
+    status: TestCaseStatus = TestCaseStatus.PENDING
+    executor: Optional[str] = None
+    execution_date: Optional[str] = None
+    related_scene_ids: Optional[List[str]] = None
+    notes: Optional[str] = None
+    updater: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class TestCaseQueryRequest(BaseModel):
+    """Test case query request."""
+    case_type: Optional[TestCaseType] = None
+    module: Optional[str] = None
+    status: Optional[TestCaseStatus] = None
+    priority: Optional[str] = None
+    executor: Optional[str] = None
+    page_size: int = Field(default=20, ge=1, le=100)
+
+
+class TestCaseQueryResponse(BaseModel):
+    """Test case query response."""
+    total: int
+    cases: List[TestCaseInfo]
+    page_token: Optional[str] = None
+
+
+class TestCaseUpdateRequest(BaseModel):
+    """Test case update request."""
+    case_id: str
+    status: Optional[TestCaseStatus] = None
+    executor: Optional[str] = None
+    execution_date: Optional[str] = None
+    related_scene_ids: Optional[List[str]] = None
+    notes: Optional[str] = None
+
+
+class TestCaseUpdateResponse(BaseModel):
+    """Test case update response."""
+    case_id: str
+    updated: bool
+    message: str
+
+
+# ============== Scene (场景) Schemas ==============
+
+class SceneInfo(BaseModel):
+    """Scene info for coverage tracking."""
+    scene_id: str
+    scene_name: str
+    module: str
+    related_requirements: List[str] = []
+    coverage_rate: float = 0.0  # 0.0 - 1.0
+    total_cases: int = 0
+    passed_cases: int = 0
+    failed_cases: int = 0
+    blocked_cases: int = 0
+
+
+class SceneCoverageUpdateRequest(BaseModel):
+    """Scene coverage update request."""
+    scene_id: str
+    executed_cases: int = 0
+    passed_cases: int = 0
+    failed_cases: int = 0
+    blocked_cases: int = 0

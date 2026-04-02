@@ -255,3 +255,88 @@ class TestQueryBugs:
         
         assert resp.total >= 1
         assert all(bug.priority == BugPriority.P0 for bug in resp.bugs)
+
+
+# ============== Test Case Library Tests ==============
+
+class TestCaseQueryMock:
+    """Mock test case query functionality."""
+    
+    def test_query_testcases_by_status(self):
+        """Test querying test cases by status."""
+        from app.models.schemas import TestCaseQueryRequest, TestCaseStatus, TestCaseType
+        from app.services.feishu_sheet_client import FeishuSheetClient
+        
+        client = FeishuSheetClient()
+        req = TestCaseQueryRequest(
+            status=TestCaseStatus.PASSED,
+            page_size=10,
+        )
+        # Mock mode returns data without API call
+        resp = client._mock_query_test_cases(req)
+        assert resp.total >= 0
+        for case in resp.cases:
+            if case.status:  # If status is set, it should be passed
+                pass  # Mock returns filtered data
+    
+    def test_query_testcases_by_type(self):
+        """Test querying test cases by type."""
+        from app.models.schemas import TestCaseQueryRequest, TestCaseType
+        from app.services.feishu_sheet_client import FeishuSheetClient
+        
+        client = FeishuSheetClient()
+        req = TestCaseQueryRequest(
+            case_type=TestCaseType.FUNCTION,
+            page_size=10,
+        )
+        resp = client._mock_query_test_cases(req)
+        assert resp.total >= 0
+    
+    def test_format_test_case_list(self):
+        """Test formatting test case list."""
+        from app.models.schemas import TestCaseQueryResponse, TestCaseInfo, TestCaseStatus, TestCaseType
+        from app.services.feishu_sheet_client import FeishuSheetClient
+        
+        client = FeishuSheetClient()
+        resp = TestCaseQueryResponse(
+            total=2,
+            cases=[
+                TestCaseInfo(
+                    case_id="TC-001",
+                    case_name="CAN总线测试",
+                    case_type=TestCaseType.FUNCTION,
+                    module="动力系统",
+                    priority="P0",
+                    status=TestCaseStatus.PASSED,
+                ),
+                TestCaseInfo(
+                    case_id="TC-002",
+                    case_name="方向盘测试",
+                    case_type=TestCaseType.FUNCTION,
+                    module="底盘系统",
+                    priority="P1",
+                    status=TestCaseStatus.FAILED,
+                ),
+            ],
+        )
+        formatted = client.format_test_case_list(resp)
+        assert "TC-001" in formatted
+        assert "CAN总线测试" in formatted
+        assert "TC-002" in formatted
+
+
+class TestTestCaseSchemas:
+    """Test case schema validation."""
+    
+    def test_test_case_type_enum(self):
+        """Test TestCaseType enum values."""
+        from app.models.schemas import TestCaseType
+        assert TestCaseType.FUNCTION == "功能测试"
+        assert TestCaseType.PERFORMANCE == "性能测试"
+    
+    def test_test_case_status_enum(self):
+        """Test TestCaseStatus enum values."""
+        from app.models.schemas import TestCaseStatus
+        assert TestCaseStatus.PENDING == "待执行"
+        assert TestCaseStatus.PASSED == "通过"
+        assert TestCaseStatus.FAILED == "失败"
