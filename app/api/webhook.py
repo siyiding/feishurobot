@@ -152,9 +152,118 @@ async def execute_handler(handler_name: str, params: dict, command) -> str:
 
     elif category == "action":
         if action == "create_bug":
-            return "缺陷创建功能正在开发中，预计M1 Week3-4完成。"
+            from app.models.schemas import BugCreateRequest, BugPriority
+            
+            # Get bug title from params or raw message
+            bug_title = params.get("bug_title", "")
+            if not bug_title:
+                # Try to extract from raw message
+                import re
+                title_match = re.search(r"(?:创建|新建|添加)(?:个?)?(?:缺陷|bug|问题)(?:[:：])?\s*(.+?)(?:\s+(?:在|项目|优先级|指派))?$", command.raw_message)
+                if title_match:
+                    bug_title = title_match.group(1).strip()
+                else:
+                    # Pattern: "ICC项目创建一个CAN总线异常"
+                    title_match2 = re.search(r"(?:项目)?(.+?)(?:缺陷|bug|问题)$", command.raw_message)
+                    if title_match2:
+                        bug_title = title_match2.group(1).strip()
+            
+            if not bug_title:
+                return "请提供缺陷标题。例如：「创建CAN总线通信异常缺陷」"
+            
+            # Get project key
+            project_key = params.get("project_key", "ICC")  # Default to ICC
+            
+            # Get priority
+            priority_str = params.get("priority", "p2")
+            try:
+                priority = BugPriority(priority_str.lower())
+            except ValueError:
+                priority = BugPriority.P2
+            
+            # Get assignee
+            assignee = params.get("assignee")
+            
+            req = BugCreateRequest(
+                title=bug_title,
+                project_key=project_key,
+                priority=priority,
+                assignee=assignee,
+            )
+            
+            resp = await client.create_bug(req)
+            
+            # Trigger P0 push if priority is P0
+            if priority == BugPriority.P0:
+                try:
+                    from app.services.push_service import get_push_service
+                    push_svc = get_push_service()
+                    await push_svc.enqueue_p0_alert(
+                        title=f"【P0告警】新建严重缺陷",
+                        content=f"项目{project_key}新建P0缺陷：{bug_title}",
+                        bug_id=resp.bug_id,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to enqueue P0 alert: {e}")
+            
+            return resp.message
+        
         elif action == "update_bug":
-            return "缺陷状态更新功能正在开发中，预计M1 Week3-4完成。"
+            from app.models.schemas import BugUpdateRequest, BugStatus
+            
+            bug_id = params.get("bug_id")
+            if not bug_id:
+                # Try to extract bug_id from raw message
+                import re
+                bug_match = re.search(r"(bug_\d+|[a-zA-Z0-9_]{8,})", command.raw_message, re.IGNORECASE)
+                if bug_match:
+                    bug_id = bug_match.group(1).lower()
+            
+            if not bug_id:
+                return "请提供要更新的缺陷ID。例如：「把bug_001状态改成已解决」"
+            
+            # Determine status to set
+            status = None
+            if params.get("status"):
+                try:
+                    status = BugStatus(params["status"])
+                except ValueError:
+                    pass
+            
+            # Determine priority
+            priority = None
+            if params.get("priority"):
+                try:
+                    priority = BugPriority(params["priority"].lower())
+                except ValueError:
+                    pass
+            
+            assignee = params.get("assignee")
+            
+            req = BugUpdateRequest(
+                bug_id=bug_id,
+                status=status,
+                priority=priority,
+                assignee=assignee,
+            )
+            
+            resp = await client.update_bug(req)
+            
+            # Trigger P0 push if priority is P0 or status changed to resolved
+            if priority == BugPriority.P0 or (status == BugStatus.RESOLVED and resp.updated):
+                try:
+                    from app.services.push_service import get_push_service
+                    push_svc = get_push_service()
+                    await push_svc.enqueue_p0_alert(
+                        title=f"P0缺陷更新" if priority == BugPriority.P0 else "【P0已解决】",
+                        content=f"缺陷{bug_id}状态更新",
+                        bug_id=bug_id,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to enqueue P0 alert: {e}")
+            
+            return resp.message
+        
         else:
             return f"未知的操作类型: {action}"
 

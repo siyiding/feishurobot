@@ -3,11 +3,16 @@ Feishu Project API Client.
 
 Wraps the Feishu Project API for bug/task management.
 """
+import uuid
+from datetime import datetime
 from typing import List, Optional
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
-from app.models.schemas import BugInfo, BugStatus, BugPriority, BugQueryRequest, BugQueryResponse, ProjectInfo
+from app.models.schemas import (
+    BugInfo, BugStatus, BugPriority, BugQueryRequest, BugQueryResponse,
+    ProjectInfo, BugCreateRequest, BugCreateResponse, BugUpdateRequest, BugUpdateResponse
+)
 
 logger = get_logger(__name__)
 
@@ -133,18 +138,194 @@ class FeishuProjectClient:
     async def get_bug(self, bug_id: str) -> Optional[BugInfo]:
         """Get a single bug by ID."""
         logger.info(f"Getting bug: {bug_id}")
-        # Placeholder
-        return BugInfo(
+        # Initialize mock data if needed
+        self._init_mock_bugs()
+        
+        # Placeholder - in production, call Feishu Project API
+        # GET /open-apis/baike/v1/bug_issues/{bug_id}
+        for bug in self._mock_bugs:
+            if bug.bug_id == bug_id:
+                return bug
+        return None
+
+    # In-memory mock bug storage for demonstration
+    _mock_bugs: List[BugInfo] = []
+
+    def _init_mock_bugs(self):
+        """Initialize mock bug data."""
+        if not self._mock_bugs:
+            self._mock_bugs = [
+                BugInfo(
+                    bug_id="bug_001",
+                    title="CAN总线通信异常",
+                    status=BugStatus.OPEN,
+                    priority=BugPriority.P0,
+                    project_key="ICC",
+                    project_name="ICC整车测试",
+                    assignee="张三",
+                    creator="李四",
+                    created_at="2026-04-01T10:00:00Z",
+                    updated_at="2026-04-01T10:00:00Z",
+                    description="CAN总线在高速行驶时出现通信中断",
+                ),
+                BugInfo(
+                    bug_id="bug_002",
+                    title="方向盘转向助力失效",
+                    status=BugStatus.IN_PROGRESS,
+                    priority=BugPriority.P0,
+                    project_key="ICC",
+                    project_name="ICC整车测试",
+                    assignee="王五",
+                    creator="赵六",
+                    created_at="2026-03-30T14:30:00Z",
+                    updated_at="2026-04-01T09:00:00Z",
+                    description="方向盘转向助力在低温环境下失效",
+                ),
+                BugInfo(
+                    bug_id="bug_003",
+                    title="仪表盘显示花屏",
+                    status=BugStatus.RESOLVED,
+                    priority=BugPriority.P1,
+                    project_key="ICC",
+                    project_name="ICC整车测试",
+                    assignee="孙七",
+                    creator="周八",
+                    created_at="2026-03-25T11:00:00Z",
+                    updated_at="2026-04-01T18:00:00Z",
+                    description="仪表盘在启动时偶发花屏问题",
+                ),
+            ]
+
+    async def create_bug(self, request: BugCreateRequest) -> BugCreateResponse:
+        """
+        Create a new bug/issue.
+        
+        Args:
+            request: BugCreateRequest with bug details
+            
+        Returns:
+            BugCreateResponse with created bug info
+        """
+        logger.info(f"Creating bug: {request.title} in project {request.project_key}")
+        
+        # Initialize mock data if needed
+        self._init_mock_bugs()
+        
+        # Generate new bug ID
+        bug_id = f"bug_{str(uuid.uuid4())[:8]}"
+        now = datetime.utcnow().isoformat() + "Z"
+        
+        # Get project name from known projects
+        project_names = {
+            "ICC": "ICC整车测试",
+            "ADAS": "ADAS功能测试",
+            "COCKPIT": "智能座舱测试",
+        }
+        project_name = project_names.get(request.project_key, request.project_key)
+        
+        # Create new bug
+        new_bug = BugInfo(
             bug_id=bug_id,
-            title="CAN总线通信异常",
+            title=request.title,
             status=BugStatus.OPEN,
-            priority=BugPriority.P0,
-            project_key="ICC",
-            project_name="ICC整车测试",
-            assignee="张三",
-            creator="李四",
-            created_at="2026-04-01T10:00:00Z",
-            updated_at="2026-04-01T10:00:00Z",
+            priority=request.priority,
+            project_key=request.project_key,
+            project_name=project_name,
+            assignee=request.assignee,
+            creator=request.assignee or "系统",
+            created_at=now,
+            updated_at=now,
+            description=request.description,
+        )
+        
+        self._mock_bugs.append(new_bug)
+        logger.info(f"Bug created: {bug_id}")
+        
+        return BugCreateResponse(
+            bug_id=bug_id,
+            title=request.title,
+            status=BugStatus.OPEN,
+            priority=request.priority,
+            created=True,
+            message=f"缺陷「{request.title}」创建成功！\nID: `{bug_id}`\n优先级: {request.priority.value.upper()}\n状态: 📋 待处理",
+        )
+
+    async def update_bug(self, request: BugUpdateRequest) -> BugUpdateResponse:
+        """
+        Update an existing bug.
+        
+        Args:
+            request: BugUpdateRequest with bug ID and fields to update
+            
+        Returns:
+            BugUpdateResponse with update result
+        """
+        logger.info(f"Updating bug: {request.bug_id}")
+        
+        # Initialize mock data if needed
+        self._init_mock_bugs()
+        
+        # Find the bug
+        bug = None
+        for b in self._mock_bugs:
+            if b.bug_id == request.bug_id:
+                bug = b
+                break
+        
+        if not bug:
+            return BugUpdateResponse(
+                bug_id=request.bug_id,
+                updated=False,
+                message=f"未找到缺陷 `{request.bug_id}`，请检查缺陷ID是否正确。",
+            )
+        
+        # Apply updates
+        now = datetime.utcnow().isoformat() + "Z"
+        changes = []
+        
+        if request.status is not None:
+            old_status = bug.status
+            bug.status = request.status
+            changes.append(f"状态: {old_status.value} → {request.status.value}")
+        
+        if request.priority is not None:
+            old_priority = bug.priority
+            bug.priority = request.priority
+            changes.append(f"优先级: {old_priority.value} → {request.priority.value}")
+        
+        if request.assignee is not None:
+            old_assignee = bug.assignee or "未分配"
+            bug.assignee = request.assignee
+            changes.append(f"指派人: {old_assignee} → {request.assignee}")
+        
+        if request.description is not None:
+            bug.description = request.description
+            changes.append("描述已更新")
+        
+        bug.updated_at = now
+        
+        if not changes:
+            return BugUpdateResponse(
+                bug_id=request.bug_id,
+                updated=False,
+                message="没有需要更新的字段。",
+            )
+        
+        logger.info(f"Bug {request.bug_id} updated: {', '.join(changes)}")
+        
+        # Format status text for display
+        status_text = {
+            BugStatus.OPEN: "📋 待处理",
+            BugStatus.IN_PROGRESS: "🔄 处理中",
+            BugStatus.RESOLVED: "✅ 已解决",
+            BugStatus.CLOSED: "🔒 已关闭",
+            BugStatus.REJECTED: "❌ 已拒绝",
+        }.get(bug.status, "❓ 未知")
+        
+        return BugUpdateResponse(
+            bug_id=request.bug_id,
+            updated=True,
+            message=f"缺陷 `{request.bug_id}` 更新成功！\n" + "\n".join([f"• {c}" for c in changes]) + f"\n\n当前状态: {status_text}",
         )
 
     def format_bug_list(self, response: BugQueryResponse) -> str:

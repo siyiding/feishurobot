@@ -26,15 +26,32 @@ QUERY_PATTERNS = [
 
 ACTION_PATTERNS = [
     (r"创建|新建|添加", IntentType.ACTION),
-    (r"更新|修改|改变.*状态", IntentType.ACTION),
+    (r"更新|修改|改变", IntentType.ACTION),
     (r"指派|分配", IntentType.ACTION),
     (r"关闭|完成|解决", IntentType.ACTION),
+    (r"状态改成|状态改为|改成|改为", IntentType.ACTION),
 ]
 
 REPORT_PATTERNS = [
     (r"报告|周报|月报", IntentType.REPORT),
     (r"统计|汇总|总结", IntentType.REPORT),
     (r"导出|生成.*报告", IntentType.REPORT),
+]
+
+
+# Bug creation patterns
+CREATE_BUG_PATTERNS = [
+    r"创建(?:个?|个)?(?:缺陷|bug|问题)(?:[:：])?(.*)",
+    r"新建(?:个?|个)?(?:缺陷|bug|问题)(?:[:：])?(.*)",
+    r"添加(?:个?|个)?(?:缺陷|bug|问题)(?:[:：])?(.*)",
+    r"(.*)(?:缺陷|bug|问题)",
+]
+
+# Bug update patterns
+UPDATE_BUG_PATTERNS = [
+    r"(bug_\d+|[a-zA-Z0-9_]+)\s*(?:状态|state)?\s*(?:改成|改为|改成|改成|改成)\s*(\w+)",
+    r"把\s*(bug_\d+|[a-zA-Z0-9_]+)\s*(?:状态|state)?\s*(?:改成|改为|改成)\s*(\w+)",
+    r"更新\s*(?:缺陷)?\s*(?:ID)?\s*(bug_\d+|[a-zA-Z0-9_]+)\s*(?:状态)?\s*(?:改成|改为)?\s*(\w+)",
 ]
 
 
@@ -108,15 +125,22 @@ def parse_command(message: str, intent: IntentType) -> BotCommand:
     if project_match:
         params["project_key"] = project_match.group(1).strip()
 
+    # Extract bug_id for update operations
+    bug_id_match = re.search(r"(bug_\d+|[a-zA-Z0-9_]{8,})", message, re.IGNORECASE)
+    if bug_id_match:
+        params["bug_id"] = bug_id_match.group(1).lower()
+
     # Extract status keywords
     if re.search(r"未关闭|open|新建", message.lower()):
         params["status"] = "open"
-    elif re.search(r"进行中|in.?progress", message.lower()):
+    elif re.search(r"进行中|in.?progress|处理中", message.lower()):
         params["status"] = "in_progress"
-    elif re.search(r"已解决|resolved", message.lower()):
+    elif re.search(r"已解决|resolved|已修复", message.lower()):
         params["status"] = "resolved"
     elif re.search(r"已关闭|closed", message.lower()):
         params["status"] = "closed"
+    elif re.search(r"已拒绝|rejected", message.lower()):
+        params["status"] = "rejected"
 
     # Extract priority
     if re.search(r"p0|P0|严重", message):
@@ -125,6 +149,25 @@ def parse_command(message: str, intent: IntentType) -> BotCommand:
         params["priority"] = "p1"
     elif re.search(r"p2|P2", message):
         params["priority"] = "p2"
+    elif re.search(r"p3|P3", message):
+        params["priority"] = "p3"
+
+    # Extract assignee
+    assignee_match = re.search(r"指派给\s*(\S+)", message)
+    if assignee_match:
+        params["assignee"] = assignee_match.group(1)
+
+    # Extract bug title for creation
+    if intent == IntentType.ACTION and ("创建" in message or "新建" in message or "添加" in message):
+        # Try to extract the bug title
+        title_match = re.search(r"(?:创建|新建|添加)(?:个?)?(?:缺陷|bug|问题)(?:[:：])?\s*(.+?)(?:\s+(?:在|项目|优先级|指派))?$", message)
+        if title_match:
+            params["bug_title"] = title_match.group(1).strip()
+        else:
+            # Try alternative pattern: "ICC项目创建一个CAN总线异常缺陷"
+            title_match2 = re.search(r"(?:项目)?(.+?)(?:缺陷|bug|问题)$", message)
+            if title_match2:
+                params["bug_title"] = title_match2.group(1).strip()
 
     # Sub-command based on intent
     sub_command = None
@@ -139,9 +182,12 @@ def parse_command(message: str, intent: IntentType) -> BotCommand:
             sub_command = "query_bugs"  # default query
 
     elif intent == IntentType.ACTION:
-        if "创建" in message or "新建" in message:
+        # Determine if it's create or update
+        if "创建" in message or "新建" in message or "添加" in message:
             sub_command = "create_bug"
-        elif "更新" in message or "修改" in message:
+        elif "更新" in message or "修改" in message or "改成" in message or "改为" in message:
+            sub_command = "update_bug"
+        elif "指派" in message or "分配" in message:
             sub_command = "update_bug"
         else:
             sub_command = "create_bug"

@@ -73,6 +73,54 @@ class BugQueryResponse(BaseModel):
     page_token: Optional[str] = None
 
 
+class BugCreateRequest(BaseModel):
+    """Bug creation request."""
+    title: str
+    project_key: str
+    priority: BugPriority = BugPriority.P2
+    description: Optional[str] = None
+    assignee: Optional[str] = None
+
+
+class BugUpdateRequest(BaseModel):
+    """Bug update request."""
+    bug_id: str
+    status: Optional[BugStatus] = None
+    priority: Optional[BugPriority] = None
+    assignee: Optional[str] = None
+    description: Optional[str] = None
+
+
+class BugCreateResponse(BaseModel):
+    """Bug creation response."""
+    bug_id: str
+    title: str
+    status: BugStatus
+    priority: BugPriority
+    created: bool
+    message: str
+
+
+class BugUpdateResponse(BaseModel):
+    """Bug update response."""
+    bug_id: str
+    updated: bool
+    message: str
+
+
+class PushMessage(BaseModel):
+    """Push message for Redis queue."""
+    id: str
+    level: str = Field(default="P2")  # P0, P1, P2
+    msg_type: str = Field(default="bug_update")  # bug_new, bug_update, task_overdue, dr_alert
+    title: str
+    content: str
+    url: Optional[str] = None
+    user_id: Optional[str] = None  # open_id for targeted push
+    created_at: str
+    enqueue_at: Optional[str] = None
+
+
 class FeishuWebhookEvent(BaseModel):
     """Feishu webhook event payload."""
     schema_: str = Field(alias="schema")
