@@ -40,7 +40,7 @@ INTENT_TEMPLATES = {
     },
     "query_bugs_by_priority": {
         "keywords": [r"[Pp]0.*缺陷", r"[Pp]1.*缺陷", r"[Pp]2.*缺陷", r"严重.*缺陷", r"高优.*缺陷", r"缺陷.*优先级"],
-        "priority": 9,
+        "priority": 11,  # Fixed: was 9, changed to 11 to avoid conflict with query_bugs_open (priority 10)
         "params_extractor": "extract_bug_filters",
     },
     "query_bugs_by_project": {

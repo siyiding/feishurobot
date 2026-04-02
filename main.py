@@ -18,6 +18,7 @@ from app.core.config import get_settings
 from app.core.logging import setup_logging
 from app.api.webhook import router as webhook_router
 from app.api.bug_webhook import router as bug_webhook_router
+from app.api.bug_automation import router as bug_automation_router
 
 # Initialize logging
 setup_logging("feishurobot")
@@ -47,6 +48,7 @@ app.add_middleware(
 # Include routers
 app.include_router(webhook_router)
 app.include_router(bug_webhook_router)
+app.include_router(bug_automation_router)
 
 # Root endpoint
 @app.get("/", tags=["root"])
