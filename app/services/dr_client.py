@@ -1,39 +1,27 @@
 """
-DR (Data Report) API Client - Pre-research Implementation.
+DR (Data Report) Platform Client — CLI Mode.
 
-This module provides a preliminary implementation for DR platform API integration.
-Since the DR platform API documentation is not yet available, this implements:
+DR平台对接客户端，基于CLI调用模式重写（2026-04-02修正）。
 
-1. API structure based on common automotive data reporting patterns
-2. Authentication method assumptions (JWT/Bearer token based on D5 decision)
-3. Signal data query interfaces
-4. Chart generation support via matplotlib
+核心变更：
+- 不再使用 HTTP API，改用 subprocess 调用 DR CLI
+- 查询维度：按行程（trip）查问题列表，不是信号/时间戳
+- 不解析 bag 包，只查询关联元数据
+- 图表生成暂不实现（等 CLI 返回格式确认后再设计）
 
-TODO: Update with actual DR API documentation when available (D5 dependency)
+CLI 命令格式（初稿，待 DR 平台确认）：
+- dr query --trip <trip_id>         # 按行程查问题列表
+- dr tag --info <tag_id>             # 查看 Tag 信息
+- dr trip --list --vehicle <vehicle_id>  # 列出车辆行程
+
+返回格式：TBD（可能是结构化文本或 JSON），框架预置解析占位。
 """
 import json
-import base64
+import subprocess
+import hashlib
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
-from io import BytesIO
 from enum import Enum
-
-try:
-    import aiohttp
-    AIOHTTP_AVAILABLE = True
-except ImportError:
-    AIOHTTP_AVAILABLE = False
-    aiohttp = None
-
-try:
-    import matplotlib
-    matplotlib.use('Agg')  # Non-interactive backend
-    import matplotlib.pyplot as plt
-    import matplotlib.dates as mdates
-    MATPLOTLIB_AVAILABLE = True
-except ImportError:
-    MATPLOTLIB_AVAILABLE = False
-    plt = None
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -41,510 +29,700 @@ from app.core.logging import get_logger
 logger = get_logger(__name__)
 
 
+# ============================================================================
+# CLI 命令格式（初稿，待 DR 平台确认）
+# ============================================================================
+
+class DR_CLI_CMD:
+    """DR CLI 命令占位符。实际命令格式待 DR 平台确认后填充。"""
+    
+    # base command - may include auth flags like --token or env vars
+    BASE = "dr"
+    
+    @staticmethod
+    def query_trip(trip_id: str) -> List[str]:
+        """
+        按行程ID查询问题列表。
+        TODO: 确认具体命令格式，如 dr query --trip <id> 或其他
+        """
+        return [DR_CLI_CMD.BASE, "query", "--trip", trip_id]
+    
+    @staticmethod
+    def tag_info(tag_id: str) -> List[str]:
+        """
+        查看 Tag 详情（Tag 与 Bag 包一一对应）。
+        TODO: 确认具体命令格式
+        """
+        return [DR_CLI_CMD.BASE, "tag", "--info", tag_id]
+    
+    @staticmethod
+    def list_trips(vehicle_id: Optional[str] = None, limit: int = 20) -> List[str]:
+        """
+        列出车辆行程。
+        TODO: 确认具体命令格式
+        """
+        cmd = [DR_CLI_CMD.BASE, "trip", "--list"]
+        if vehicle_id:
+            cmd.extend(["--vehicle", vehicle_id])
+        cmd.extend(["--limit", str(limit)])
+        return cmd
+
+
+# ============================================================================
+# 数据模型
+# ============================================================================
+
 class DRAlertLevel(str, Enum):
-    """DR alert severity levels."""
+    """DR 问题/告警级别。"""
     INFO = "info"
     WARNING = "warning"
     ERROR = "error"
     CRITICAL = "critical"
+    UNKNOWN = "unknown"
 
 
-class DRChartType(str, Enum):
-    """Types of charts supported."""
-    LINE = "line"
-    BAR = "bar"
-    SCATTER = "scatter"
-    HISTOGRAM = "histogram"
-    TIME_SERIES = "time_series"
+class DRProblem:
+    """DR 问题记录（对应 CLI 返回的一条问题）。"""
+    
+    def __init__(
+        self,
+        problem_id: str,
+        title: str,
+        level: DRAlertLevel,
+        trip_id: str,
+        tag_id: Optional[str] = None,
+        description: Optional[str] = None,
+        created_at: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ):
+        self.problem_id = problem_id
+        self.title = title
+        self.level = level if isinstance(level, DRAlertLevel) else DRAlertLevel(level)
+        self.trip_id = trip_id
+        self.tag_id = tag_id
+        self.description = description
+        self.created_at = created_at
+        self.extra = extra or {}
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "problem_id": self.problem_id,
+            "title": self.title,
+            "level": self.level.value,
+            "trip_id": self.trip_id,
+            "tag_id": self.tag_id,
+            "description": self.description,
+            "created_at": self.created_at,
+            **self.extra,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "DRProblem":
+        return cls(
+            problem_id=str(data.get("problem_id", "")),
+            title=str(data.get("title", "")),
+            level=DRAlertLevel(data.get("level", "unknown")),
+            trip_id=str(data.get("trip_id", "")),
+            tag_id=data.get("tag_id"),
+            description=data.get("description"),
+            created_at=data.get("created_at"),
+            extra={k: v for k, v in data.items() 
+                   if k not in ("problem_id", "title", "level", "trip_id", "tag_id", "description", "created_at")},
+        )
+    
+    def summary(self) -> str:
+        """生成单条问题的简短摘要，用于飞书消息。"""
+        level_emoji = {
+            DRAlertLevel.INFO: "ℹ️",
+            DRAlertLevel.WARNING: "⚠️",
+            DRAlertLevel.ERROR: "❌",
+            DRAlertLevel.CRITICAL: "🔴",
+            DRAlertLevel.UNKNOWN: "❓",
+        }
+        emoji = level_emoji.get(self.level, "❓")
+        return f"{emoji} [{self.level.value.upper()}] {self.title}（行程:{self.trip_id}）"
 
+
+class DRTag:
+    """DR Tag 记录（Tag 与 Bag 包一一对应）。"""
+    
+    def __init__(
+        self,
+        tag_id: str,
+        vehicle_id: Optional[str] = None,
+        trip_id: Optional[str] = None,
+        created_at: Optional[str] = None,
+        notes: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ):
+        self.tag_id = tag_id
+        self.vehicle_id = vehicle_id
+        self.trip_id = trip_id
+        self.created_at = created_at
+        self.notes = notes
+        self.extra = extra or {}
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "tag_id": self.tag_id,
+            "vehicle_id": self.vehicle_id,
+            "trip_id": self.trip_id,
+            "created_at": self.created_at,
+            "notes": self.notes,
+            **self.extra,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "DRTag":
+        return cls(
+            tag_id=str(data.get("tag_id", "")),
+            vehicle_id=data.get("vehicle_id"),
+            trip_id=data.get("trip_id"),
+            created_at=data.get("created_at"),
+            notes=data.get("notes"),
+            extra={k: v for k, v in data.items()
+                   if k not in ("tag_id", "vehicle_id", "trip_id", "created_at", "notes")},
+        )
+
+
+class DRTrip:
+    """DR 行程记录。"""
+    
+    def __init__(
+        self,
+        trip_id: str,
+        vehicle_id: Optional[str] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        distance_km: Optional[float] = None,
+        tag_ids: Optional[List[str]] = None,
+        problem_count: int = 0,
+        extra: Optional[Dict[str, Any]] = None,
+    ):
+        self.trip_id = trip_id
+        self.vehicle_id = vehicle_id
+        self.start_time = start_time
+        self.end_time = end_time
+        self.distance_km = distance_km
+        self.tag_ids = tag_ids or []
+        self.problem_count = problem_count
+        self.extra = extra or {}
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "trip_id": self.trip_id,
+            "vehicle_id": self.vehicle_id,
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "distance_km": self.distance_km,
+            "tag_ids": self.tag_ids,
+            "problem_count": self.problem_count,
+            **self.extra,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "DRTrip":
+        return cls(
+            trip_id=str(data.get("trip_id", "")),
+            vehicle_id=data.get("vehicle_id"),
+            start_time=data.get("start_time"),
+            end_time=data.get("end_time"),
+            distance_km=data.get("distance_km"),
+            tag_ids=data.get("tag_ids", []),
+            problem_count=data.get("problem_count", 0),
+            extra={k: v for k, v in data.items()
+                   if k not in ("trip_id", "vehicle_id", "start_time", "end_time",
+                               "distance_km", "tag_ids", "problem_count")},
+        )
+
+
+# ============================================================================
+# CLI 返回解析器（占位，等格式确认后填充）
+# ============================================================================
+
+class DRCLIResponseParser:
+    """
+    DR CLI 返回格式解析器。
+    
+    TODO: 等 DR 平台确认 CLI 返回格式（结构化文本/JSON）后，
+          实现具体的 parse_* 方法。
+    
+    预期输入格式（初稿猜测，可能是 JSON 或格式化文本）：
+    
+    JSON 格式示例（猜测）:
+    {
+      "trip_id": "TRIP-2026-0401-001",
+      "problems": [
+        {
+          "problem_id": "PRB-001",
+          "title": "VCAN总线异常",
+          "level": "error",
+          "tag_id": "TAG-001",
+          "created_at": "2026-04-01T10:30:00Z"
+        }
+      ]
+    }
+    
+    文本格式示例（猜测）:
+    TRIP: TRIP-2026-0401-001
+    ========================
+    Problem List:
+      [ERROR] PRB-001 | VCAN总线异常 | TAG-001 | 2026-04-01 10:30:00
+      [WARN]  PRB-002 | 方向盘转角超限 | TAG-001 | 2026-04-01 10:35:00
+    """
+    
+    @classmethod
+    def parse_problem_list(
+        cls,
+        raw_output: str,
+        trip_id: str,
+    ) -> Tuple[List[DRProblem], Optional[str]]:
+        """
+        解析 dr query --trip <trip_id> 的原始输出。
+        
+        Args:
+            raw_output: CLI stdout 原始输出
+            trip_id: 对应的行程 ID
+            
+        Returns:
+            (problems列表, error_message)
+        """
+        if not raw_output or not raw_output.strip():
+            return [], None
+        
+        # 尝试 JSON 格式
+        try:
+            data = json.loads(raw_output)
+            return cls._parse_json_problems(data, trip_id)
+        except (json.JSONDecodeError, ValueError):
+            pass
+        
+        # TODO: 尝试文本格式解析（等格式确认后实现）
+        # return cls._parse_text_problems(raw_output, trip_id)
+        
+        # 降级：返回原始文本作为 description
+        logger.warning(f"[DR CLI] Unknown output format, treating as raw text. trip_id={trip_id}")
+        return [
+            DRProblem(
+                problem_id="unknown",
+                title=raw_output.strip()[:200],
+                level=DRAlertLevel.UNKNOWN,
+                trip_id=trip_id,
+                description="原始输出（格式待确认）",
+            )
+        ], None
+    
+    @classmethod
+    def _parse_json_problems(
+        cls,
+        data: Dict[str, Any],
+        trip_id: str,
+    ) -> Tuple[List[DRProblem], Optional[str]]:
+        """解析 JSON 格式的问题列表。"""
+        problems = []
+        
+        # 支持多种 JSON 结构
+        problem_list = data.get("problems", [])
+        if isinstance(data, dict) and "problems" not in data:
+            # 尝试直接从 data 提取（有些 API 直接返回数组）
+            if isinstance(data, list):
+                problem_list = data
+        
+        for item in problem_list:
+            if not isinstance(item, dict):
+                continue
+            try:
+                # 确保 trip_id 关联上
+                item["trip_id"] = item.get("trip_id", trip_id)
+                problems.append(DRProblem.from_dict(item))
+            except Exception as e:
+                logger.warning(f"[DR CLI] Failed to parse problem item: {e}, item={item}")
+                continue
+        
+        return problems, None
+    
+    @classmethod
+    def parse_tag_info(
+        cls,
+        raw_output: str,
+        tag_id: str,
+    ) -> Tuple[Optional[DRTag], Optional[str]]:
+        """解析 dr tag --info <tag_id> 的原始输出。"""
+        if not raw_output or not raw_output.strip():
+            return None, "Empty output"
+        
+        try:
+            data = json.loads(raw_output)
+            return DRTag.from_dict(data.get("tag", data)), None
+        except json.JSONDecodeError:
+            # TODO: 文本格式解析
+            logger.warning(f"[DR CLI] Unknown tag info format. tag_id={tag_id}")
+            return DRTag(tag_id=tag_id, notes=raw_output.strip()[:500]), None
+    
+    @classmethod
+    def parse_trip_list(
+        cls,
+        raw_output: str,
+    ) -> Tuple[List[DRTrip], Optional[str]]:
+        """解析 dr trip --list 的原始输出。"""
+        if not raw_output or not raw_output.strip():
+            return [], None
+        
+        try:
+            data = json.loads(raw_output)
+            trip_list = data.get("trips", []) if isinstance(data, dict) else data
+            return [DRTrip.from_dict(t) for t in trip_list], None
+        except json.JSONDecodeError:
+            logger.warning(f"[DR CLI] Unknown trip list format.")
+            return [], None
+
+
+# ============================================================================
+# DR CLI 执行器
+# ============================================================================
+
+class DRCLIExecutor:
+    """
+    DR CLI 命令执行器。
+    
+    封装 subprocess 调用，处理：
+    - 命令执行与超时
+    - 返回码校验
+    - stderr 日志
+    - Mock 模式（CLI 不可用时降级）
+    """
+    
+    def __init__(self, cli_path: str = "dr", timeout: int = 30):
+        """
+        Args:
+            cli_path: DR CLI 可执行文件路径，默认 "dr"（PATH 中查找）
+            timeout: 命令超时时间（秒）
+        """
+        self.cli_path = cli_path
+        self.timeout = timeout
+    
+    def run(self, args: List[str], input_text: Optional[str] = None) -> Tuple[int, str, str]:
+        """
+        执行 DR CLI 命令。
+        
+        Args:
+            args: 命令参数列表，如 ["query", "--trip", "TRIP-001"]
+            input_text: stdin 输入（可选）
+            
+        Returns:
+            (return_code, stdout, stderr)
+        """
+        cmd = [self.cli_path] + args
+        logger.info(f"[DR CLI] Executing: {' '.join(cmd)}")
+        
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+                input=input_text,
+            )
+            return result.returncode, result.stdout, result.stderr
+        
+        except subprocess.TimeoutExpired:
+            logger.error(f"[DR CLI] Command timeout after {self.timeout}s: {' '.join(cmd)}")
+            return -1, "", f"Command timeout after {self.timeout}s"
+        
+        except FileNotFoundError:
+            logger.error(f"[DR CLI] CLI executable not found: {self.cli_path}")
+            return -2, "", f"CLI not found: {self.cli_path}"
+        
+        except Exception as e:
+            logger.error(f"[DR CLI] Unexpected error: {e}")
+            return -3, "", str(e)
+
+
+# ============================================================================
+# DR Client 主类（CLI 模式）
+# ============================================================================
 
 class DRClient:
     """
-    DR Platform API Client.
+    DR 平台客户端（CLI 模式）。
     
-    Pre-research implementation based on:
-    - D5 decision: "定时+实时混合+10分钟Buffer"
-    - Common automotive data platform patterns
-    - Signal data query patterns
+    设计原则：
+    - subprocess 调用 DR CLI，不走 HTTP API
+    - 按行程（trip）查询问题列表，不拉 bag 包
+    - 所有方法均为异步（async），方便后续扩展
+    - CLI 命令格式初稿，待 DR 平台确认
     
-    NOTE: This is a preliminary implementation. Update with actual API
-    documentation when DR platform team provides it.
+    使用示例：
+    
+        client = DRClient()
+        
+        # 按行程查问题列表
+        problems, err = await client.query_trip_problems("TRIP-2026-0401-001")
+        
+        # 查看 Tag 详情
+        tag, err = await client.get_tag_info("TAG-001")
+        
+        # 列出车辆行程
+        trips, err = await client.list_trips(vehicle_id="VEH-001")
+    
+    TODO（等 DR 平台确认后填充）：
+    - CLI 实际命令格式
+    - CLI 鉴权方式（环境变量？--token 参数？）
+    - 返回数据具体字段
     """
     
     def __init__(self):
         settings = get_settings()
         
-        # DR API configuration (to be updated with actual endpoints)
-        self.api_base = getattr(settings, 'dr_api_base', 'https://dr-platform.example.com/api/v1')
-        self.api_key = getattr(settings, 'dr_api_key', '')
-        self.timeout = 30
+        # CLI 配置
+        self.cli_path = getattr(settings, 'dr_cli_path', 'dr')
+        self.cli_timeout = getattr(settings, 'dr_cli_timeout', 30)
+        self._executor = DRCLIExecutor(cli_path=self.cli_path, timeout=self.cli_timeout)
         
-        self._session: Optional[aiohttp.ClientSession] = None
-        self._connected = False
+        # Mock 模式：CLI 不可用时降级
+        self._mock_mode = False
     
-    async def connect(self):
-        """Establish connection to DR API."""
-        if not AIOHTTP_AVAILABLE:
-            logger.warning("aiohttp not available. DRClient will operate in mock mode.")
-            self._connected = False
-            return
-        
-        if self._session is None:
-            try:
-                self._session = aiohttp.ClientSession(
-                    timeout=aiohttp.ClientTimeout(total=self.timeout),
-                    headers={
-                        "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json",
-                    }
-                )
-                self._connected = True
-                logger.info("DR API session established")
-            except Exception as e:
-                logger.warning(f"Failed to connect to DR API: {e}")
-                self._connected = False
+    # ==================== 公开 API ====================
     
-    async def disconnect(self):
-        """Close DR API session."""
-        if self._session:
-            await self._session.close()
-            self._session = None
-            self._connected = False
-    
-    async def _ensure_connected(self):
-        """Ensure DR API is connected."""
-        if not self._connected:
-            await self.connect()
-    
-    async def _make_request(
+    async def query_trip_problems(
         self,
-        method: str,
-        endpoint: str,
-        data: Optional[Dict] = None,
-        params: Optional[Dict] = None,
-    ) -> Dict[str, Any]:
+        trip_id: str,
+    ) -> Tuple[List[DRProblem], Optional[str]]:
         """
-        Make HTTP request to DR API.
+        按行程ID查询问题列表。
+        
+        这是 DR 查询的核心方法，机器人对 DR 的主要操作。
         
         Args:
-            method: HTTP method (GET, POST, etc.)
-            endpoint: API endpoint path
-            data: Request body data
-            params: Query parameters
+            trip_id: 行程 ID，如 "TRIP-2026-0401-001"
             
         Returns:
-            Response JSON data
+            (problems列表, error_message)
+            - problems: 问题对象列表（可能为空）
+            - error_message: 出错时返回错误信息（此时 problems 可能部分有效）
+        """
+        cmd = DR_CLI_CMD.query_trip(trip_id)
+        returncode, stdout, stderr = self._executor.run(cmd)
+        
+        if returncode != 0:
+            error_msg = f"CLI error (code={returncode}): {stderr}"
+            logger.error(f"[DR Client] {error_msg}")
             
-        Raises:
-            DRAPIError on request failure
-        """
-        await self._ensure_connected()
+            if returncode == -2:  # CLI not found
+                self._mock_mode = True
+                logger.warning("[DR Client] Falling back to MOCK mode")
+                return self._mock_trip_problems(trip_id)
+            
+            return [], error_msg
         
-        if not self._connected or not self._session:
-            # Return mock data in disconnected mode
-            return self._get_mock_response(endpoint, data, params)
+        problems, parse_err = DRCLIResponseParser.parse_problem_list(stdout, trip_id)
+        if parse_err:
+            logger.warning(f"[DR Client] Parse warning: {parse_err}")
         
-        url = f"{self.api_base}{endpoint}"
-        
-        try:
-            async with self._session.request(
-                method, url, json=data, params=params
-            ) as response:
-                if response.status == 200:
-                    return await response.json()
-                elif response.status == 401:
-                    raise DRAPIError("DR API authentication failed", response.status)
-                elif response.status == 404:
-                    raise DRAPIError(f"DR API endpoint not found: {endpoint}", response.status)
-                else:
-                    text = await response.text()
-                    raise DRAPIError(f"DR API error: {text}", response.status)
-                    
-        except aiohttp.ClientError as e:
-            logger.error(f"DR API request failed: {e}")
-            raise DRAPIError(f"DR API request failed: {e}")
+        return problems, parse_err
     
-    def _get_mock_response(
+    async def get_tag_info(
         self,
-        endpoint: str,
-        data: Optional[Dict],
-        params: Optional[Dict],
-    ) -> Dict[str, Any]:
-        """Generate mock response for development/testing."""
-        logger.info(f"[MOCK] DR API response for {endpoint}")
-        
-        if "signals" in endpoint:
-            return self._get_mock_signals_data()
-        elif "alerts" in endpoint:
-            return self._get_mock_alerts_data()
-        elif "metrics" in endpoint:
-            return self._get_mock_metrics_data()
-        else:
-            return {"status": "mock", "endpoint": endpoint}
-    
-    def _get_mock_signals_data(self) -> Dict[str, Any]:
-        """Generate mock signal data."""
-        now = datetime.now()
-        return {
-            "status": "success",
-            "data": {
-                "signals": [
-                    {
-                        "signal_id": "sig_001",
-                        "name": "Battery Voltage",
-                        "value": 12.5,
-                        "unit": "V",
-                        "timestamp": now.isoformat(),
-                        "quality": "good",
-                    },
-                    {
-                        "signal_id": "sig_002",
-                        "name": "Motor Speed",
-                        "value": 3500,
-                        "unit": "RPM",
-                        "timestamp": now.isoformat(),
-                        "quality": "good",
-                    },
-                    {
-                        "signal_id": "sig_003",
-                        "name": "Temperature",
-                        "value": 45.2,
-                        "unit": "°C",
-                        "timestamp": now.isoformat(),
-                        "quality": "good",
-                    },
-                ]
-            }
-        }
-    
-    def _get_mock_alerts_data(self) -> Dict[str, Any]:
-        """Generate mock alert data."""
-        return {
-            "status": "success",
-            "data": {
-                "alerts": [
-                    {
-                        "alert_id": "alt_001",
-                        "level": "warning",
-                        "message": "Battery voltage below threshold",
-                        "signal_id": "sig_001",
-                        "value": 11.8,
-                        "threshold": 12.0,
-                        "timestamp": datetime.now().isoformat(),
-                    }
-                ]
-            }
-        }
-    
-    def _get_mock_metrics_data(self) -> Dict[str, Any]:
-        """Generate mock metrics data."""
-        dates = [(datetime.now() - timedelta(hours=i)).isoformat() for i in range(24)]
-        return {
-            "status": "success",
-            "data": {
-                "metrics": [
-                    {
-                        "metric_id": "met_001",
-                        "name": "System Uptime",
-                        "values": [{"timestamp": d, "value": 99.5 + i*0.01} for i, d in enumerate(dates)],
-                    }
-                ]
-            }
-        }
-    
-    # ==================== Signal Data API ====================
-    
-    async def query_signals(
-        self,
-        signal_ids: Optional[List[str]] = None,
-        start_time: Optional[datetime] = None,
-        end_time: Optional[datetime] = None,
-        max_points: int = 1000,
-    ) -> Dict[str, Any]:
+        tag_id: str,
+    ) -> Tuple[Optional[DRTag], Optional[str]]:
         """
-        Query signal data from DR platform.
+        查看 Tag 详情（Tag 与 Bag 包一一对应）。
         
         Args:
-            signal_ids: List of signal IDs to query
-            start_time: Start of time range
-            end_time: End of time range
-            max_points: Maximum number of data points
+            tag_id: Tag ID
             
         Returns:
-            Signal data response
+            (tag_info, error_message)
         """
-        params = {
-            "max_points": max_points,
-        }
+        cmd = DR_CLI_CMD.tag_info(tag_id)
+        returncode, stdout, stderr = self._executor.run(cmd)
         
-        if start_time:
-            params["start_time"] = start_time.isoformat()
-        if end_time:
-            params["end_time"] = end_time.isoformat()
-        if signal_ids:
-            params["signal_ids"] = ",".join(signal_ids)
+        if returncode != 0:
+            if returncode == -2:
+                self._mock_mode = True
+                return self._mock_tag_info(tag_id)
+            return None, f"CLI error: {stderr}"
         
-        return await self._make_request("GET", "/signals/query", params=params)
+        return DRCLIResponseParser.parse_tag_info(stdout, tag_id)
     
-    async def get_signal_latest(
+    async def list_trips(
         self,
-        signal_id: str,
-    ) -> Optional[Dict[str, Any]]:
+        vehicle_id: Optional[str] = None,
+        limit: int = 20,
+    ) -> Tuple[List[DRTrip], Optional[str]]:
         """
-        Get latest value for a signal.
+        列出车辆行程。
         
         Args:
-            signal_id: Signal identifier
+            vehicle_id: 车辆 ID（可选，不填则查所有）
+            limit: 返回数量上限
             
         Returns:
-            Latest signal data or None
+            (trips列表, error_message)
         """
-        try:
-            response = await self._make_request("GET", f"/signals/{signal_id}/latest")
-            data = response.get("data", {})
-            signals = data.get("signals", [])
-            return signals[0] if signals else None
-        except DRAPIError as e:
-            logger.error(f"Failed to get signal latest: {e}")
-            return None
+        cmd = DR_CLI_CMD.list_trips(vehicle_id=vehicle_id, limit=limit)
+        returncode, stdout, stderr = self._executor.run(cmd)
+        
+        if returncode != 0:
+            if returncode == -2:
+                self._mock_mode = True
+                return self._mock_list_trips(limit)
+            return [], f"CLI error: {stderr}"
+        
+        return DRCLIResponseParser.parse_trip_list(stdout)
     
-    # ==================== Alert API ====================
-    
-    async def query_alerts(
+    async def query_recent_problems(
         self,
+        hours: int = 24,
         level: Optional[DRAlertLevel] = None,
-        start_time: Optional[datetime] = None,
-        end_time: Optional[datetime] = None,
-        acknowledged: Optional[bool] = None,
-    ) -> List[Dict[str, Any]]:
+    ) -> Tuple[List[DRProblem], Optional[str]]:
         """
-        Query alerts from DR platform.
+        查询最近 N 小时内的问题列表。
+        
+        实现方式：先查最近行程，再查每个行程的问题。
+        TODO: 如果 DR CLI 有直接的时间过滤命令，可优化此处。
         
         Args:
-            level: Filter by alert level
-            start_time: Start of time range
-            end_time: End of time range
-            acknowledged: Filter by acknowledgement status
+            hours: 时间窗口（小时）
+            level: 按级别过滤（可选）
             
         Returns:
-            List of alerts
+            (problems列表, error_message)
         """
-        params = {}
+        all_problems = []
         
-        if level:
-            params["level"] = level.value
-        if start_time:
-            params["start_time"] = start_time.isoformat()
-        if end_time:
-            params["end_time"] = end_time.isoformat()
-        if acknowledged is not None:
-            params["acknowledged"] = str(acknowledged).lower()
+        # 查最近行程
+        trips, err = await self.list_trips(limit=hours)
+        if err:
+            return [], err
         
-        response = await self._make_request("GET", "/alerts/query", params=params)
-        return response.get("data", {}).get("alerts", [])
+        for trip in trips:
+            problems, _ = await self.query_trip_problems(trip.trip_id)
+            for p in problems:
+                if level is None or p.level == level:
+                    all_problems.append(p)
+        
+        # 按时间倒序
+        all_problems.sort(key=lambda x: x.created_at or "", reverse=True)
+        return all_problems, None
     
-    async def acknowledge_alert(
+    # ==================== 格式化输出 ====================
+    
+    async def format_problems_for_feishu(
         self,
-        alert_id: str,
-    ) -> bool:
-        """
-        Acknowledge an alert.
-        
-        Args:
-            alert_id: Alert identifier
-            
-        Returns:
-            True if successful
-        """
-        try:
-            await self._make_request("POST", f"/alerts/{alert_id}/acknowledge")
-            return True
-        except DRAPIError as e:
-            logger.error(f"Failed to acknowledge alert: {e}")
-            return False
-    
-    # ==================== Chart Generation ====================
-    
-    async def generate_signal_chart(
-        self,
-        signal_id: str,
-        chart_type: DRChartType = DRChartType.LINE,
-        start_time: Optional[datetime] = None,
-        end_time: Optional[datetime] = None,
+        problems: List[DRProblem],
         title: Optional[str] = None,
-    ) -> Optional[str]:
+    ) -> str:
         """
-        Generate a chart image for a signal.
+        将问题列表格式化为飞书消息文本。
         
         Args:
-            signal_id: Signal to chart
-            chart_type: Type of chart
-            start_time: Start of time range
-            end_time: End of time range
-            title: Chart title
+            problems: 问题列表
+            title: 可选的消息标题
             
         Returns:
-            Base64-encoded PNG image, or None on failure
+            格式化的 markdown 文本
         """
-        if not MATPLOTLIB_AVAILABLE:
-            logger.warning("matplotlib not available for chart generation")
-            return None
+        if not problems:
+            return "✅ 该行程暂无问题记录"
         
-        # Fetch signal data
-        data = await self.query_signals(
-            signal_ids=[signal_id],
-            start_time=start_time,
-            end_time=end_time,
-        )
+        lines = []
+        if title:
+            lines.append(f"**{title}**\n")
         
-        signal_data = data.get("data", {}).get("signals", [])
-        if not signal_data:
-            return None
+        lines.append(f"共 **{len(problems)}** 个问题：\n")
         
-        # Extract values and timestamps
-        values = []
-        timestamps = []
+        # 按级别分组
+        by_level: Dict[DRAlertLevel, List[DRProblem]] = {}
+        for p in problems:
+            by_level.setdefault(p.level, []).append(p)
         
-        for point in signal_data:
-            try:
-                values.append(float(point.get("value", 0)))
-                ts = datetime.fromisoformat(point.get("timestamp", "").replace("Z", "+00:00"))
-                timestamps.append(ts.replace(tzinfo=None))
-            except (ValueError, TypeError):
+        for lvl in [DRAlertLevel.CRITICAL, DRAlertLevel.ERROR,
+                    DRAlertLevel.WARNING, DRAlertLevel.INFO, DRAlertLevel.UNKNOWN]:
+            if lvl not in by_level:
                 continue
+            for p in by_level[lvl]:
+                lines.append(p.summary())
         
-        if not values:
-            return None
-        
-        # Generate chart
-        fig, ax = plt.subplots(figsize=(10, 6))
-        
-        if chart_type == DRChartType.LINE:
-            ax.plot(timestamps, values, marker='o', markersize=3)
-        elif chart_type == DRChartType.BAR:
-            ax.bar(range(len(values)), values)
-        elif chart_type == DRChartType.SCATTER:
-            ax.scatter(range(len(values)), values, s=20)
-        elif chart_type == DRChartType.HISTOGRAM:
-            ax.hist(values, bins=20)
-        else:
-            ax.plot(timestamps, values)
-        
-        ax.set_xlabel("Time")
-        ax.set_ylabel(signal_data[0].get("name", "Value"))
-        ax.set_title(title or f"Signal: {signal_id}")
-        ax.grid(True, alpha=0.3)
-        
-        # Format x-axis for time series
-        if chart_type == DRChartType.TIME_SERIES or len(timestamps) > 1:
-            fig.autofmt_xdate()
-        
-        # Convert to base64
-        buffer = BytesIO()
-        plt.savefig(buffer, format='png', dpi=100, bbox_inches='tight')
-        plt.close(fig)
-        
-        buffer.seek(0)
-        image_base64 = base64.b64encode(buffer.read()).decode()
-        
-        return image_base64
+        return "\n".join(lines)
     
-    # ==================== Anomaly Detection ====================
+    # ==================== Mock 模式（CLI 不可用时降级） ====================
     
-    async def check_anomaly(
-        self,
-        signal_id: str,
-        threshold_high: Optional[float] = None,
-        threshold_low: Optional[float] = None,
-        std_dev_multiplier: float = 3.0,
-    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
-        """
-        Check if signal value exceeds thresholds.
-        
-        Args:
-            signal_id: Signal to check
-            threshold_high: Upper threshold
-            threshold_low: Lower threshold
-            std_dev_multiplier: Use N*std_dev for dynamic threshold if fixed not provided
-            
-        Returns:
-            Tuple of (is_anomaly, anomaly_details)
-        """
-        latest = await self.get_signal_latest(signal_id)
-        if not latest:
-            return False, None
-        
-        value = float(latest.get("value", 0))
-        
-        # Check fixed thresholds
-        if threshold_high and value > threshold_high:
-            return True, {
-                "signal_id": signal_id,
-                "value": value,
-                "threshold": threshold_high,
-                "type": "high",
-                "message": f"{signal_id} value {value} exceeds threshold {threshold_high}",
-            }
-        
-        if threshold_low and value < threshold_low:
-            return True, {
-                "signal_id": signal_id,
-                "value": value,
-                "threshold": threshold_low,
-                "type": "low",
-                "message": f"{signal_id} value {value} below threshold {threshold_low}",
-            }
-        
-        # TODO: Implement std_dev based anomaly detection
-        # Requires historical data to calculate mean and std_dev
-        
-        return False, None
+    def _mock_trip_problems(self, trip_id: str) -> Tuple[List[DRProblem], None]:
+        """Mock：返回假数据，用于 CLI 不可用时的开发调试。"""
+        logger.info(f"[DR Client] MOCK: query_trip_problems({trip_id})")
+        return [
+            DRProblem(
+                problem_id="MOCK-PRB-001",
+                title="[Mock] VCAN总线异常计数超限",
+                level=DRAlertLevel.ERROR,
+                trip_id=trip_id,
+                tag_id="MOCK-TAG-001",
+                description="这是 Mock 数据，CLI 不可用时降级使用",
+                created_at=datetime.now().isoformat(),
+            ),
+            DRProblem(
+                problem_id="MOCK-PRB-002",
+                title="[Mock] 方向盘转角超限",
+                level=DRAlertLevel.WARNING,
+                trip_id=trip_id,
+                tag_id="MOCK-TAG-001",
+                created_at=datetime.now().isoformat(),
+            ),
+        ], None
     
-    # ==================== Subscription ====================
+    def _mock_tag_info(self, tag_id: str) -> Tuple[Optional[DRTag], None]:
+        """Mock: Tag 信息。"""
+        return DRTag(
+            tag_id=tag_id,
+            vehicle_id="MOCK-VEH-001",
+            trip_id="MOCK-TRIP-001",
+            created_at=datetime.now().isoformat(),
+            notes="Mock data - CLI unavailable",
+        ), None
     
-    async def subscribe_signals(
-        self,
-        signal_ids: List[str],
-        callback_url: Optional[str] = None,
-    ) -> bool:
-        """
-        Subscribe to real-time signal updates.
-        
-        Args:
-            signal_ids: Signals to subscribe
-            callback_url: Webhook URL for updates (optional)
-            
-        Returns:
-            True if successful
-        """
-        data = {
-            "signal_ids": signal_ids,
-        }
-        if callback_url:
-            data["callback_url"] = callback_url
-        
-        try:
-            await self._make_request("POST", "/signals/subscribe", data=data)
-            return True
-        except DRAPIError as e:
-            logger.error(f"Failed to subscribe signals: {e}")
-            return False
+    def _mock_list_trips(self, limit: int) -> Tuple[List[DRTrip], None]:
+        """Mock: 行程列表。"""
+        now = datetime.now()
+        return [
+            DRTrip(
+                trip_id=f"MOCK-TRIP-{i:03d}",
+                vehicle_id="MOCK-VEH-001",
+                start_time=(now - timedelta(hours=i)).isoformat(),
+                end_time=(now - timedelta(hours=i-1)).isoformat(),
+                distance_km=10.5 + i,
+                problem_count=i % 3,
+            )
+            for i in range(1, min(limit, 5) + 1)
+        ], None
 
 
-class DRAPIError(Exception):
-    """DR API Error."""
-    def __init__(self, message: str, status_code: Optional[int] = None):
+# ============================================================================
+# 异常类
+# ============================================================================
+
+class DRClientError(Exception):
+    """DR Client 通用错误。"""
+    def __init__(self, message: str, cli_code: Optional[int] = None):
         self.message = message
-        self.status_code = status_code
+        self.cli_code = cli_code
         super().__init__(message)
 
 
-# Singleton
+class DRParseError(DRClientError):
+    """DR CLI 返回数据解析失败。"""
+    pass
+
+
+# ============================================================================
+# 单例
+# ============================================================================
+
 _dr_client: Optional[DRClient] = None
 
 
 def get_dr_client() -> DRClient:
-    """Get singleton DRClient instance."""
+    """获取单例 DRClient 实例。"""
     global _dr_client
     if _dr_client is None:
         _dr_client = DRClient()
