@@ -6,6 +6,8 @@ from app.core.logging import get_logger
 from app.models.schemas import FeishuWebhookEvent, BotResponse, IntentType
 from app.services.intent_router import recognize_intent, parse_command, route_command
 from app.services.feishu_project_client import get_project_client, FeishuProjectClient
+from app.services.conversation_service import get_conversation_service
+from app.services.nl_query_service import get_nl_query_service
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/webhook", tags=["webhook"])
@@ -53,11 +55,12 @@ async def handle_message_receive(body: dict) -> dict:
     """
     Handle im.message.receive_v1 event.
     
-    Flow:
+    Flow (M4 Enhanced):
     1. Parse message content
-    2. Recognize intent (QUERY/ACTION/REPORT)
-    3. Route to appropriate handler
-    4. Return formatted response
+    2. Use NL Query Service for natural language understanding (20 templates)
+    3. Fall back to traditional intent routing if NL fails
+    4. Store conversation context for follow-up queries
+    5. Return formatted response
     """
     try:
         message_content = body.get("data", {}).get("message", {}).get("content", "")
@@ -79,19 +82,56 @@ async def handle_message_receive(body: dict) -> dict:
                 intent=IntentType.QUERY,
             )
 
-        # Step 1: Intent recognition
+        # Get conversation context for follow-up queries
+        conversation_service = get_conversation_service()
+        conv_context = await conversation_service.get_context(sender_id)
+        context_dict = {
+            "project_key": conv_context.project_key,
+            "last_query_type": conv_context.last_query_type,
+        }
+        
+        # Try NL Query Service first (M4 enhancement with 20 templates)
+        nl_service = get_nl_query_service()
+        
+        # Check if this might be a natural language query
+        nl_keywords = ["查", "看看", "多少", "列表", "生成", "报告", "进度", "里程", "覆盖"]
+        is_likely_nl_query = any(kw in text for kw in nl_keywords)
+        
+        if is_likely_nl_query:
+            nl_result = await nl_service.process_query(sender_id, text, context_dict if context_dict["last_query_type"] else None)
+            
+            if nl_result.get("intent") != "unknown":
+                logger.info(f"NL Query matched: {nl_result.get('intent')}")
+                
+                # Add to conversation history
+                await conversation_service.add_message(sender_id, "user", text, nl_result.get("intent"))
+                await conversation_service.add_message(sender_id, "assistant", nl_result.get("response_text")[:200], nl_result.get("intent"))
+                
+                # Update project context if specified
+                if nl_result.get("params", {}).get("project_key"):
+                    await conversation_service.update_project_context(sender_id, nl_result["params"]["project_key"])
+                
+                return BotResponse(
+                    content=nl_result.get("response_text"),
+                    intent=IntentType.QUERY,
+                    data=nl_result,
+                )
+        
+        # Fall back to traditional intent routing
         intent_confidence = recognize_intent(text)
         logger.info(f"Recognized intent: {intent_confidence.intent} ({intent_confidence.confidence:.2f})")
 
-        # Step 2: Parse command
         command = parse_command(text, intent_confidence.intent)
         logger.info(f"Parsed command: {command.sub_command}, params={command.params}")
 
-        # Step 3: Route and execute
         handler_name, handler_params = route_command(command)
         logger.info(f"Routing to: {handler_name}")
 
-        response_content = await execute_handler(handler_name, handler_params, command)
+        response_content = await execute_handler(handler_name, handler_params, command, sender_id)
+
+        # Add to conversation history
+        await conversation_service.add_message(sender_id, "user", text, command.sub_command)
+        await conversation_service.add_message(sender_id, "assistant", response_content[:200], command.sub_command)
 
         return BotResponse(
             content=response_content,
@@ -107,7 +147,7 @@ async def handle_message_receive(body: dict) -> dict:
         )
 
 
-async def execute_handler(handler_name: str, params: dict, command) -> str:
+async def execute_handler(handler_name: str, params: dict, command, sender_id: str = None) -> str:
     """
     Execute the appropriate handler based on routing.
     
@@ -298,28 +338,25 @@ async def execute_handler(handler_name: str, params: dict, command) -> str:
 
     elif category == "report":
         if action == "weekly_report":
-            # M3: 周报摘要推送
+            # M4: 周报生成并写入飞书文档
             try:
-                from app.services.weekly_report_service import get_weekly_report_service
-                report_service = get_weekly_report_service()
+                from app.services.report_generation_service import get_report_generation_service
+                report_service = get_report_generation_service()
                 project_key = params.get("project_key", "ICC")
-                content = await report_service.generate_weekly_summary(project_key)
                 
-                # Push the report
-                from app.services.push_service import get_push_service
-                push_svc = get_push_service()
-                await push_svc.enqueue_p1_notification(
-                    msg_type="weekly_report",
-                    title="📊 周报摘要",
-                    content=content,
+                result = await report_service.generate_weekly_report(
+                    project_key=project_key,
+                    time_range="last_week",
+                    user_id=sender_id,
                 )
-                return "周报已生成并推送，请查收。"
+                
+                return result.get("message", "周报生成完成")
             except Exception as e:
                 logger.error(f"Failed to generate weekly report: {e}")
                 return f"周报生成失败: {str(e)}"
         
         elif action == "monthly_report":
-            return "月报生成功能正在开发中，预计M3阶段完成。"
+            return "月报生成功能正在开发中，预计M4阶段完成。"
         else:
             return f"未知的报告类型: {action}"
 
