@@ -160,6 +160,33 @@ class FeishuSheetClient:
         Returns:
             TestCaseQueryResponse with matching test cases
         """
+        return await self._query_test_cases_impl(request)
+    
+    async def query_cases_by_module(self, module: str, page_size: int = 50) -> List[TestCaseInfo]:
+        """
+        Query test cases by module name.
+        
+        Args:
+            module: Module name to filter by
+            page_size: Maximum number of cases to return
+            
+        Returns:
+            List of TestCaseInfo matching the module
+        """
+        request = TestCaseQueryRequest(module=module, page_size=page_size)
+        response = await self._query_test_cases_impl(request)
+        return response.cases
+    
+    async def _query_test_cases_impl(self, request: TestCaseQueryRequest) -> TestCaseQueryResponse:
+        """
+        Query test cases with filters.
+        
+        Args:
+            request: TestCaseQueryRequest with filters
+            
+        Returns:
+            TestCaseQueryResponse with matching test cases
+        """
         logger.info(f"Querying test cases: type={request.case_type}, module={request.module}, status={request.status}")
         
         # Get sheet meta first
@@ -528,9 +555,15 @@ class FeishuSheetClient:
 _sheet_client: Optional[FeishuSheetClient] = None
 
 
-def get_sheet_client() -> FeishuSheetClient:
+def get_feishu_sheet_client() -> FeishuSheetClient:
     """Get singleton FeishuSheetClient instance."""
     global _sheet_client
     if _sheet_client is None:
         _sheet_client = FeishuSheetClient()
     return _sheet_client
+
+
+# Alias for backwards compatibility
+def get_sheet_client() -> FeishuSheetClient:
+    """Get singleton FeishuSheetClient instance."""
+    return get_feishu_sheet_client()
